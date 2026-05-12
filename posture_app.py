@@ -1,0 +1,1000 @@
+import sys
+import cv2
+import json
+import time
+import numpy as np
+from datetime import datetime, timedelta
+from pathlib import Path
+from collections import defaultdict
+ 
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QPushButton, QStackedWidget, QLineEdit, QFrame,
+    QScrollArea, QGridLayout, QMessageBox
+)
+from PyQt5.QtCore import (
+    Qt, QTimer, QThread, pyqtSignal, QPropertyAnimation, QEasingCurve
+)
+from PyQt5.QtGui import (
+    QImage, QPixmap, QColor, QPainter, QPen, QBrush
+)
+
+def show_posture_popup(parent=None):
+    msg = QMessageBox(parent)
+    msg.setWindowTitle("⚠ Posture Alert")
+    msg.setText(
+        "🚨  Bad Posture Detected!\n\n"
+        "You've been in a bad posture\n"
+        "for more than 30 seconds.\n\n"
+        "Please sit up straight and\n"
+        "correct your position now!"
+    )
+    
+    msg.setIcon(QMessageBox.Warning)
+    msg.setStandardButtons(QMessageBox.Ok)
+    msg.setStyleSheet("""
+        QMessageBox {
+            background-color: #0D0F14;
+            color: #F0F4FF;
+            font-size: 14px;
+        }
+        QLabel {
+            color: #F0F4FF;
+            font-size: 14px;
+        }
+        QPushButton {
+            background: #00E5A0;
+            color: #000;
+            border-radius: 8px;
+            padding: 8px 24px;
+            font-weight: bold;
+            font-size: 13px;
+        }
+        QPushButton:hover { background: #00ffb3; }
+    """)
+    msg.exec_()
+# ─── Constants ────────────────────────────────────────────────────────────────
+DATA_FILE = Path.home() / ".posture_guard" / "data.json"
+DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+ 
+POSTURE_ALERT_SECONDS = 20
+CHECK_INTERVAL_MS     = 500
+ 
+ 
+# ─── Colors ───────────────────────────────────────────────────────────────────
+DARK_BG  = "#0D0F14"
+CARD_BG  = "#141720"
+ACCENT   = "#00E5A0"
+ACCENT2  = "#00BFFF"
+WARN     = "#FF6B35"
+DANGER   = "#FF2D55"
+GOOD     = "#00E5A0"
+TEXT_PRI = "#F0F4FF"
+TEXT_SEC = "#8892AA"
+BORDER   = "#252A38"
+
+ 
+ 
+# ─── Posture Analyser (heuristic only — no torch dependency) ──────────────────
+class PostureAnalyser:
+    """
+    Uses OpenCV face + body cascade heuristics.
+    Always returns exactly (label: str, confidence: float, frame: np.ndarray).
+    """
+ 
+    def __init__(self):
+        self.face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        )
+        self.upper_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_upperbody.xml"
+        )
+        # Try loading YOLO silently — won't crash if unavailable
+        self.model = None
+        try:
+            from ultralytics import YOLO
+            self.model = YOLO("yolov8n-pose.pt")
+            print("[PostureGuard] YOLOv8-pose loaded ✓")
+        except Exception as e:
+            print(f"[PostureGuard] Running in heuristic mode (no YOLO): {e}")
+ 
+    def analyse(self, frame: np.ndarray):
+        """Always returns (label, confidence, annotated_frame) — guaranteed 3 values."""
+        if frame is None or frame.size == 0:
+            blank = np.zeros((480, 640, 3), dtype=np.uint8)
+            return "No person detected", 0.0, blank
+ 
+        try:
+            if self.model is not None:
+                return self._yolo_analyse(frame)
+            return self._heuristic_analyse(frame)
+        except Exception as e:
+            print(f"[PostureGuard] analyse error: {e}")
+            return "Detection error", 0.0, frame.copy()
+ 
+    # ── YOLO path ─────────────────────────────────────────────────────────────
+    def _yolo_analyse(self, frame):
+        try:
+            results   = self.model(frame, verbose=False)[0]
+            annotated = results.plot()
+            if results.keypoints is None or len(results.keypoints.data) == 0:
+                return "No person detected", 0.0, annotated
+            kp = results.keypoints.data[0].cpu().numpy()
+            label, conf = self._classify_keypoints(kp)
+            return label, conf, annotated
+        except Exception as e:
+            print(f"[PostureGuard] YOLO analyse error: {e}")
+            return self._heuristic_analyse(frame)
+ 
+    def _classify_keypoints(self, kp):
+        def vis(i): return kp[i][2] > 0.4
+ 
+        if not (vis(5) and vis(6)):
+            return "Uncertain", 0.5
+ 
+        ls, rs  = kp[5], kp[6]
+        lh, rh  = kp[11], kp[12]
+        nose    = kp[0]
+        smid_y  = (ls[1] + rs[1]) / 2
+        smid_x  = (ls[0] + rs[0]) / 2
+        sw      = abs(ls[0] - rs[0])
+ 
+        if vis(0) and sw > 10:
+            if abs((nose[0] - smid_x) / sw) > 0.35:
+                return "Forward Head Posture", 0.82
+ 
+        if abs(ls[1] - rs[1]) > 25:
+            return "Uneven Shoulders", 0.78
+ 
+        if vis(11) and vis(12):
+            hmid_x  = (lh[0] + rh[0]) / 2
+            torso_h = abs(smid_y - (lh[1] + rh[1]) / 2)
+            if torso_h > 10:
+                lean = (smid_x - hmid_x) / torso_h
+                if lean > 0.25:
+                    return "Slouching Forward", 0.80
+                if lean < -0.25:
+                    return "Leaning Back", 0.75
+ 
+        return "Good Posture", 0.90
+ 
+    # ── Heuristic path ────────────────────────────────────────────────────────
+    def _heuristic_analyse(self, frame):
+        annotated = frame.copy()
+        h, w      = frame.shape[:2]
+        gray      = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+ 
+        faces = self.face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(60, 60))
+ 
+        if len(faces) == 0:
+            # Try upper body
+            bodies = self.upper_cascade.detectMultiScale(gray, 1.1, 3, minSize=(80, 80))
+            if len(bodies) == 0:
+                return "No person detected", 0.0, annotated
+            # If body found but no face → likely slouching (head below camera)
+            bx, by, bw, bh = bodies[0]
+            cv2.rectangle(annotated, (bx, by), (bx+bw, by+bh), (255, 165, 0), 2)
+            cv2.putText(annotated, "Body only — face not visible",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 165, 0), 2)
+            return "Slouching / Head Low", 0.70, annotated
+ 
+        fx, fy, fw, fh = faces[0]
+        cv2.rectangle(annotated, (fx, fy), (fx+fw, fy+fh), (0, 255, 150), 2)
+ 
+        face_cx      = fx + fw // 2
+        face_top_rel = fy / h          # 0 = top of frame, 1 = bottom
+        horiz_off    = (face_cx - w/2) / (w/2)   # -1..+1
+ 
+        # Draw centre guideline
+        cv2.line(annotated, (w//2, 0), (w//2, h), (80, 80, 80), 1)
+ 
+        label, conf = "Good Posture", 0.88
+ 
+        if face_top_rel < 0.12:
+            label, conf = "Leaning Back / Head Too High", 0.72
+        elif face_top_rel > 0.42:
+            label, conf = "Slouching / Head Too Low", 0.76
+        elif abs(horiz_off) > 0.28:
+            label, conf = "Head Tilted Sideways", 0.70
+ 
+        color = (0, 230, 130) if label == "Good Posture" else (0, 100, 255)
+        cv2.putText(annotated, label, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
+        return label, conf, annotated
+ 
+ 
+ 
+# ─── Data Store ───────────────────────────────────────────────────────────────
+class DataStore:
+    def __init__(self):
+        self.data = self._load()
+ 
+    def _load(self):
+        if DATA_FILE.exists():
+            try:
+                with open(DATA_FILE) as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {"users": {}}
+ 
+    def save(self):
+        with open(DATA_FILE, "w") as f:
+            json.dump(self.data, f, indent=2)
+ 
+    def ensure_user(self, name):
+        if name not in self.data["users"]:
+            self.data["users"][name] = {"sessions": []}
+            self.save()
+ 
+    def log_session(self, name, session):
+        self.ensure_user(name)
+        self.data["users"][name]["sessions"].append(session)
+        self.save()
+ 
+    def weekly_stats(self, name):
+        self.ensure_user(name)
+        cutoff = datetime.now() - timedelta(days=7)
+        stats  = defaultdict(lambda: {"good": 0, "bad": 0, "alerts": 0, "minutes": 0})
+        for s in self.data["users"][name]["sessions"]:
+            try:
+                dt = datetime.fromisoformat(s["date"])
+            except Exception:
+                continue
+            if dt < cutoff:
+                continue
+            day = dt.strftime("%a %d")
+            stats[day]["good"]    += s.get("good_frames", 0)
+            stats[day]["bad"]     += s.get("bad_frames",  0)
+            stats[day]["alerts"]  += s.get("alerts",      0)
+            stats[day]["minutes"] += s.get("duration_min", 0)
+        days, ordered = [], {}
+        for i in range(6, -1, -1):
+            d = (datetime.now() - timedelta(days=i)).strftime("%a %d")
+            days.append(d)
+            ordered[d] = stats.get(d, {"good": 0, "bad": 0, "alerts": 0, "minutes": 0})
+        return days, ordered
+ 
+    def all_users(self):
+        return list(self.data["users"].keys())
+ 
+ 
+# ─── Camera Worker ────────────────────────────────────────────────────────────
+class CameraWorker(QThread):
+    frame_ready      = pyqtSignal(np.ndarray, str, float)
+    bad_posture_tick = pyqtSignal(int)
+ 
+    def __init__(self, analyser):
+        super().__init__()
+        self.analyser   = analyser
+        self.running    = False
+        self._bad_start = None
+ 
+    def run(self):
+        self.running = True
+        cap = self._open_camera()
+ 
+        if cap is None:
+            print("[PostureGuard] ERROR: Cannot open any camera.")
+            blank = np.zeros((480, 640, 3), dtype=np.uint8)
+            cv2.putText(blank, "No camera found", (180, 240),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 80, 255), 2)
+            self.frame_ready.emit(blank, "No person detected", 0.0)
+            return
+ 
+        while self.running:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                time.sleep(0.1)
+                continue
+ 
+            label, conf, annotated = self.analyser.analyse(frame)
+            self.frame_ready.emit(annotated, label, conf)
+ 
+            is_bad = label not in ("Good Posture", "No person detected",
+                                   "Uncertain", "Detection error")
+            if is_bad:
+                if self._bad_start is None:
+                    self._bad_start = time.time()
+                self.bad_posture_tick.emit(int(time.time() - self._bad_start))
+            else:
+                self._bad_start = None
+                self.bad_posture_tick.emit(0)
+ 
+            time.sleep(CHECK_INTERVAL_MS / 1000)
+ 
+        cap.release()
+ 
+    def _open_camera(self):
+        """Try DirectShow indexes 0-2 on Windows, fallback to default."""
+        backends = [cv2.CAP_DSHOW, cv2.CAP_ANY]
+        for backend in backends:
+            for idx in range(3):
+                try:
+                    cap = cv2.VideoCapture(idx, backend)
+                    if cap.isOpened():
+                        ok, test = cap.read()
+                        if ok and test is not None:
+                            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+                            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                            print(f"[PostureGuard] Camera opened: index={idx} backend={backend}")
+                            return cap
+                    cap.release()
+                except Exception as e:
+                    print(f"[PostureGuard] Camera {idx} failed: {e}")
+        return None
+ 
+    def stop(self):
+        self.running = False
+        self.wait(3000)
+ 
+ 
+# ─── Stylesheet ───────────────────────────────────────────────────────────────
+def style_sheet():
+    return f"""
+    QMainWindow, QWidget {{
+        background: {DARK_BG};
+        color: {TEXT_PRI};
+        font-family: 'Courier New', monospace;
+    }}
+    QLabel  {{ color: {TEXT_PRI}; }}
+    QLineEdit {{
+        background: {CARD_BG};
+        border: 1.5px solid {BORDER};
+        border-radius: 8px;
+        color: {TEXT_PRI};
+        padding: 10px 14px;
+        font-size: 14px;
+    }}
+    QLineEdit:focus {{ border: 1.5px solid {ACCENT}; }}
+    QPushButton {{
+        background: {ACCENT};
+        color: #000;
+        border: none;
+        border-radius: 8px;
+        padding: 11px 28px;
+        font-size: 13px;
+        font-weight: bold;
+        letter-spacing: 1px;
+    }}
+    QPushButton:hover   {{ background: #00ffb3; }}
+    QPushButton:pressed {{ background: #00cc88; }}
+    QPushButton#secondary {{
+        background: transparent;
+        border: 1.5px solid {ACCENT};
+        color: {ACCENT};
+    }}
+    QPushButton#secondary:hover {{ background: rgba(0,229,160,0.08); }}
+    QScrollArea {{ background: transparent; border: none; }}
+    QScrollBar:vertical {{
+        background: {CARD_BG}; width: 6px; border-radius: 3px;
+    }}
+    QScrollBar::handle:vertical {{
+        background: {BORDER}; border-radius: 3px; min-height: 20px;
+    }}
+    """
+ 
+ 
+# ─── Custom widgets ───────────────────────────────────────────────────────────
+class Card(QFrame):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setStyleSheet(f"QFrame {{ background:{CARD_BG}; border:1px solid {BORDER}; border-radius:12px; }}")
+ 
+ 
+class PostureBar(QWidget):
+    def __init__(self, good=0, bad=0, parent=None):
+        super().__init__(parent)
+        self.good, self.bad = good, bad
+        self.setFixedHeight(14)
+ 
+    def set_values(self, good, bad):
+        self.good, self.bad = good, bad
+        self.update()
+ 
+    def paintEvent(self, _):
+        p     = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        total  = self.good + self.bad or 1
+        good_w = int(self.width() * self.good / total)
+        p.setBrush(QBrush(QColor(BORDER)))
+        p.setPen(Qt.NoPen)
+        p.drawRoundedRect(0, 0, self.width(), self.height(), 7, 7)
+        if good_w > 0:
+            p.setBrush(QBrush(QColor(GOOD)))
+            p.drawRoundedRect(0, 0, good_w, self.height(), 7, 7)
+        bad_w = self.width() - good_w
+        if bad_w > 0 and self.bad > 0:
+            p.setBrush(QBrush(QColor(WARN)))
+            p.drawRoundedRect(good_w, 0, bad_w, self.height(), 7, 7)
+        p.end()
+ 
+ 
+class AlertBanner(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMaximumHeight(0)
+        self.setStyleSheet(f"background:{DANGER}; border-radius:10px;")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(16, 0, 16, 0)
+        self.icon = QLabel("⚠")
+        self.icon.setStyleSheet("color:#fff; font-size:18px;")
+        self.text = QLabel("")
+        self.text.setStyleSheet("color:#fff; font-size:13px; font-weight:bold;")
+        lay.addWidget(self.icon)
+        lay.addWidget(self.text)
+        lay.addStretch()
+        self._anim = QPropertyAnimation(self, b"maximumHeight")
+        self._anim.setDuration(300)
+        self._anim.setEasingCurve(QEasingCurve.OutCubic)
+ 
+    def show_alert(self, msg):
+        self.text.setText(msg)
+        self._anim.stop()
+        self._anim.setStartValue(self.maximumHeight())
+        self._anim.setEndValue(52)
+        self._anim.start()
+ 
+    def hide_alert(self):
+        self._anim.stop()
+        self._anim.setStartValue(self.maximumHeight())
+        self._anim.setEndValue(0)
+        self._anim.start()
+ 
+ 
+ 
+# ─── Welcome Screen ───────────────────────────────────────────────────────────
+class WelcomeScreen(QWidget):
+    go_monitor = pyqtSignal(str)
+    go_stats   = pyqtSignal(str)
+ 
+    def __init__(self, store, parent=None):
+        super().__init__(parent)
+        self.store = store
+        self._build()
+ 
+ 
+    def _build(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(60, 60, 60, 60)
+        root.setSpacing(0)
+ 
+        hero = QLabel("POSTURE\nGUARD")
+        hero.setAlignment(Qt.AlignCenter)
+        hero.setStyleSheet(f"font-size:52px; font-weight:900; letter-spacing:8px; color:{ACCENT};")
+        root.addWidget(hero)
+ 
+        tag = QLabel("AI-powered ergonomics for healthier workdays")
+        tag.setAlignment(Qt.AlignCenter)
+        tag.setStyleSheet(f"color:{TEXT_SEC}; font-size:13px; letter-spacing:2px; margin-top:6px;")
+        root.addWidget(tag)
+        root.addSpacing(40)
+ 
+        card = Card()
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(32, 28, 32, 28)
+        cl.setSpacing(16)
+ 
+        lbl = QLabel("ENTER YOUR NAME")
+        lbl.setStyleSheet(f"color:{TEXT_SEC}; font-size:22px; letter-spacing:3px;")
+        cl.addWidget(lbl)
+ 
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("e.g.  Alex Kumar")
+        self.name_input.setFixedHeight(60)
+        self.name_input.setStyleSheet(f"""
+            background: {CARD_BG};
+            border: 1.5px solid {BORDER};
+            border-radius: 8px;
+            color: {TEXT_PRI};
+            padding: 10px 14px;
+            font-size: 20px;
+            """)
+        self.name_input.returnPressed.connect(self._start)
+        cl.addWidget(self.name_input)
+ 
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(12)
+        self.start_btn = QPushButton("▶  START MONITORING")
+        self.start_btn.setFixedHeight(46)
+        self.start_btn.clicked.connect(self._start)
+        btn_row.addWidget(self.start_btn)
+        self.stats_btn = QPushButton("📊  VIEW STATS")
+        self.stats_btn.setObjectName("secondary")
+        self.stats_btn.setFixedHeight(46)
+        self.stats_btn.clicked.connect(self._view_stats)
+        btn_row.addWidget(self.stats_btn)
+        cl.addLayout(btn_row)
+        root.addWidget(card)
+        root.addSpacing(24)
+ 
+        users = self.store.all_users()
+        if users:
+            ul = QLabel("RECENT USERS")
+            ul.setStyleSheet(f"color:{TEXT_SEC}; font-size:10px; letter-spacing:3px;")
+            root.addWidget(ul)
+            root.addSpacing(8)
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            for u in users[-6:]:
+                b = QPushButton(u)
+                b.setObjectName("secondary")
+                b.setFixedHeight(34)
+                b.clicked.connect(lambda _, n=u: self.name_input.setText(n))
+                row.addWidget(b)
+            row.addStretch()
+            root.addLayout(row)
+ 
+        root.addStretch()
+ 
+        pill_row = QHBoxLayout()
+        pill_row.setSpacing(10)
+        for txt in ["🤖  Pose Detection", "⏱  3-min Alerts", "📈  Weekly Stats", "🔒  Local Data"]:
+            p = QLabel(txt)
+            p.setStyleSheet(f"background:{CARD_BG}; border:1px solid {BORDER}; border-radius:20px; color:{TEXT_SEC}; font-size:11px; padding:6px 14px;")
+            pill_row.addWidget(p)
+        pill_row.addStretch()
+        root.addLayout(pill_row)
+ 
+    def _start(self):
+        name = self.name_input.text().strip()
+        if not name:
+            self.name_input.setPlaceholderText("⚠  Please enter your name first")
+            return
+        self.store.ensure_user(name)
+        self.go_monitor.emit(name)
+ 
+    def _view_stats(self):
+        name = self.name_input.text().strip()
+        if not name:
+            self.name_input.setPlaceholderText("⚠  Please enter your name first")
+            return
+        self.store.ensure_user(name)
+        self.go_stats.emit(name)
+ 
+ 
+# ─── Monitor Screen ───────────────────────────────────────────────────────────
+class MonitorScreen(QWidget):
+    go_home  = pyqtSignal()
+    go_stats = pyqtSignal(str)
+ 
+    def __init__(self, analyser, store, parent=None):
+        super().__init__(parent)
+        self.analyser = analyser
+        self.store    = store
+        self.username = ""
+        self.worker   = None
+        self._session = {}
+        self._start_time    = 0
+        self._alert_count   = 0
+        self._last_alert_at = 0
+        self._build()
+ 
+    def _build(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 16, 20, 16)
+        root.setSpacing(10)
+ 
+ 
+        # top bar
+        top = QHBoxLayout()
+        self.user_lbl = QLabel("●  —")
+        self.user_lbl.setStyleSheet(f"color:{ACCENT}; font-size:13px; font-weight:bold;")
+        top.addWidget(self.user_lbl)
+        top.addStretch()
+        self.session_lbl = QLabel("Session: 00:00")
+        self.session_lbl.setStyleSheet(f"color:{TEXT_SEC}; font-size:12px;")
+        top.addWidget(self.session_lbl)
+        top.addSpacing(20)
+        exit_btn = QPushButton("✕  EXIT")
+        exit_btn.setObjectName("secondary")
+        exit_btn.setFixedHeight(32)
+        exit_btn.setFixedWidth(90)
+        exit_btn.clicked.connect(self._stop_session)
+        top.addWidget(exit_btn)
+        root.addLayout(top)
+ 
+        self.alert_banner = AlertBanner()
+        root.addWidget(self.alert_banner)
+ 
+        main_row = QHBoxLayout()
+        main_row.setSpacing(14)
+ 
+        # camera feed
+        cam_card = Card()
+        cam_lay  = QVBoxLayout(cam_card)
+        cam_lay.setContentsMargins(8, 8, 8, 8)
+        cam_lay.setSpacing(4)
+        cam_hdr = QLabel("LIVE FEED")
+        cam_hdr.setStyleSheet(f"color:{TEXT_SEC}; font-size:10px; letter-spacing:3px;")
+        cam_lay.addWidget(cam_hdr)
+        self.cam_label = QLabel()
+        self.cam_label.setAlignment(Qt.AlignCenter)
+        self.cam_label.setMinimumSize(320, 240)
+        self.cam_label.setSizePolicy(
+            self.cam_label.sizePolicy().Expanding,
+            self.cam_label.sizePolicy().Expanding
+        )
+        self.cam_label.setStyleSheet("background:#080a0f; border-radius:8px;")
+        blank = QPixmap(480, 360)
+        blank.fill(QColor("#080a0f"))
+        self.cam_label.setPixmap(blank)
+        cam_lay.addWidget(self.cam_label, 1)
+        main_row.addWidget(cam_card, 2)
+ 
+        # right panel
+        rp = QVBoxLayout()
+        rp.setSpacing(12)
+ 
+        # status
+        sc = Card()
+        sl = QVBoxLayout(sc)
+        sl.setContentsMargins(20, 18, 20, 18)
+        sl.setSpacing(10)
+        sl.addWidget(self._mhdr("POSTURE STATUS"))
+        self.posture_lbl = QLabel("Starting camera…")
+        self.posture_lbl.setStyleSheet(f"font-size:28px; font-weight:bold; color:{ACCENT};")
+        self.posture_lbl.setWordWrap(True)
+        sl.addWidget(self.posture_lbl)
+        self.conf_lbl = QLabel("Confidence: —")
+        self.conf_lbl.setStyleSheet(f"color:{TEXT_SEC}; font-size:16px;")
+        sl.addWidget(self.conf_lbl)
+        self.timer_lbl = QLabel("")
+        self.timer_lbl.setStyleSheet(f"color:{WARN}; font-size:16px;")
+        self.timer_lbl.setWordWrap(True)
+        sl.addWidget(self.timer_lbl)
+        rp.addWidget(sc)
+ 
+ 
+        # stats
+        stc = Card()
+        stl = QVBoxLayout(stc)
+        stl.setContentsMargins(20, 18, 20, 18)
+        stl.setSpacing(12)
+        stl.addWidget(self._mhdr("SESSION STATS"))
+        self.good_pct_lbl = QLabel("Good posture: — %")
+        self.good_pct_lbl.setStyleSheet(f"font-size:18px; color:{TEXT_PRI};")
+        stl.addWidget(self.good_pct_lbl)
+        self.ratio_bar = PostureBar()
+        stl.addWidget(self.ratio_bar)
+        leg = QHBoxLayout()
+        gd = QLabel("■ Good")
+        gd.setStyleSheet(f"color:{GOOD}; font-size:11px;")
+        bd = QLabel("■ Bad")
+        bd.setStyleSheet(f"color:{WARN}; font-size:11px;")
+        leg.addWidget(gd); leg.addStretch(); leg.addWidget(bd)
+        stl.addLayout(leg)
+        grid = QGridLayout()
+        grid.setSpacing(10)
+        self.stat_vals = {}
+        for r, (key, lbl) in enumerate([
+            ("alerts",   "Alerts fired"),
+            ("bad_min",  "Bad posture min"),
+            ("good_min", "Good posture min"),
+        ]):
+            ll = QLabel(lbl)
+            ll.setStyleSheet(f"color:{TEXT_SEC}; font-size:15px;")
+            vl = QLabel("0")
+            vl.setStyleSheet(f"color:{TEXT_PRI}; font-size:22px; font-weight:bold;")
+            vl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.stat_vals[key] = vl
+            grid.addWidget(ll, r, 0)
+            grid.addWidget(vl, r, 1)
+        stl.addLayout(grid)
+        rp.addWidget(stc)
+ 
+        # tip
+        tc = Card()
+        tl = QVBoxLayout(tc)
+        tl.setContentsMargins(20, 14, 20, 14)
+        tl.setSpacing(6)
+        tl.addWidget(self._mhdr("ERGONOMIC TIP"))
+        self.tip_lbl = QLabel(self._tip())
+        self.tip_lbl.setWordWrap(True)
+        self.tip_lbl.setStyleSheet(f"color:{TEXT_SEC}; font-size:15px;")
+        tl.addWidget(self.tip_lbl)
+        rp.addWidget(tc)
+ 
+        rp.addStretch()
+        sb = QPushButton("📊  WEEKLY REPORT")
+        sb.setObjectName("secondary")
+        sb.setFixedHeight(42)
+        sb.clicked.connect(lambda: self.go_stats.emit(self.username))
+        rp.addWidget(sb)
+ 
+        main_row.addLayout(rp, 3)
+        root.addLayout(main_row)
+ 
+    def _mhdr(self, txt):
+        l = QLabel(txt)
+        l.setStyleSheet(f"color:{TEXT_SEC}; font-size:16px; letter-spacing:3px;")
+        return l
+ 
+    def _tip(self):
+        import random
+        return random.choice([
+            "Keep your monitor at arm's length, top at eye level.",
+            "Feet flat on floor — use a footrest if needed.",
+            "20-20-20 rule: every 20 min, look 20 ft away for 20 sec.",
+            "Elbows at 90°, wrists straight while typing.",
+            "Stand or stretch for 2 minutes every hour.",
+            "Lumbar support: lower back should gently touch your chair.",
+        ])
+ 
+ 
+    # ── Session control ───────────────────────────────────────────────────────
+    def start_session(self, username):
+        self.username       = username
+        self._start_time    = time.time()
+        self._alert_count   = 0
+        self._last_alert_at = 0
+        self.user_lbl.setText(f"●  {username}")
+        self._session = {
+            "date": datetime.now().isoformat(),
+            "good_frames": 0, "bad_frames": 0,
+            "alerts": 0, "duration_min": 0,
+        }
+        self.worker = CameraWorker(self.analyser)
+        self.worker.frame_ready.connect(self._on_frame)
+        self.worker.bad_posture_tick.connect(self._on_bad_tick)
+        self.worker.start()
+ 
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(1000)
+ 
+    def _stop_session(self):
+        if self.worker:
+            self.worker.stop()
+            self.worker = None
+        if hasattr(self, "_timer"):
+            self._timer.stop()
+        self._session["duration_min"] = max(1, int((time.time() - self._start_time) / 60))
+        self._session["alerts"]       = self._alert_count
+        self._session["good_frames"]  = self._session.get("good_frames", 0)
+        self._session["bad_frames"]   = self._session.get("bad_frames", 0)
+        self.store.log_session(self.username, self._session)
+        self.alert_banner.hide_alert()
+        self.go_home.emit()
+ 
+    def _tick(self):
+        m, s = divmod(int(time.time() - self._start_time), 60)
+        self.session_lbl.setText(f"Session: {m:02d}:{s:02d}")
+ 
+    # ── Frame handler ─────────────────────────────────────────────────────────
+    def _on_frame(self, frame, label, conf):
+        is_good = label == "Good Posture"
+        if is_good:
+            self._session["good_frames"] += 1
+        elif label not in ("No person detected", "Uncertain", "Detection error"):
+            self._session["bad_frames"] += 1
+ 
+        # display
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        qi  = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
+        pix = QPixmap.fromImage(qi).scaled(
+            self.cam_label.width(), self.cam_label.height(),
+            Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        self.cam_label.setPixmap(pix)
+ 
+        color = GOOD if is_good else (TEXT_SEC if label in ("No person detected", "Uncertain") else WARN)
+        self.posture_lbl.setText(label)
+        self.posture_lbl.setStyleSheet(f"font-size:20px; font-weight:bold; color:{color};")
+        self.conf_lbl.setText(f"Confidence: {conf*100:.0f}%")
+ 
+        gf = self._session["good_frames"]
+        bf = self._session["bad_frames"]
+        self.ratio_bar.set_values(gf, bf)
+        total = gf + bf or 1
+        self.good_pct_lbl.setText(f"Good posture: {int(gf/total*100)}%")
+        self.stat_vals["alerts"].setText(str(self._session.get("alerts", 0)))
+        self.stat_vals["bad_min"].setText(str(int(bf * CHECK_INTERVAL_MS / 60000)))
+        self.stat_vals["good_min"].setText(str(int(gf * CHECK_INTERVAL_MS / 60000)))
+ 
+    def _on_bad_tick(self, seconds):
+        if seconds == 0:
+            self.timer_lbl.setText("")
+            self.timer_lbl.setStyleSheet(f"color:{WARN}; font-size:12px;")
+            self.alert_banner.hide_alert()
+            self._last_alert_at = 0
+            return
+ 
+        remaining = POSTURE_ALERT_SECONDS - seconds
+        if remaining > 0:
+            self.timer_lbl.setText(f"⚠  Bad posture {seconds}s — alert in {remaining}s")
+            self.timer_lbl.setStyleSheet(f"color:{WARN}; font-size:12px;")
+        else:
+            if self._last_alert_at == 0 or (seconds - self._last_alert_at) >= POSTURE_ALERT_SECONDS:
+                self._alert_count            += 1
+                self._last_alert_at           = seconds
+                self._session["alerts"]       = self._alert_count
+                self.stat_vals["alerts"].setText(str(self._alert_count))
+                m, s = divmod(seconds, 60)
+                self.alert_banner.show_alert(
+                    f"⚠  Bad posture for {m}m {s}s — please adjust your position!")
+                show_posture_popup(self)   # ← ADD THIS LINE ONLY
+            self.timer_lbl.setText(f"🚨  Still in bad posture! ({seconds}s total)")
+            self.timer_lbl.setStyleSheet(f"color:{DANGER}; font-size:12px; font-weight:bold;")
+ 
+ 
+ 
+# ─── Stats Screen ─────────────────────────────────────────────────────────────
+class StatsScreen(QWidget):
+    go_home = pyqtSignal()
+ 
+    def __init__(self, store, parent=None):
+        super().__init__(parent)
+        self.store    = store
+        self.username = ""
+        self._build()
+ 
+ 
+    def _build(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(28, 20, 28, 20)
+        root.setSpacing(14)
+ 
+        top = QHBoxLayout()
+        self.title_lbl = QLabel("WEEKLY REPORT")
+        self.title_lbl.setStyleSheet(f"font-size:20px; font-weight:bold; letter-spacing:4px; color:{ACCENT};")
+        top.addWidget(self.title_lbl)
+        top.addStretch()
+        back = QPushButton("← BACK")
+        back.setObjectName("secondary")
+        back.setFixedHeight(34)
+        back.setFixedWidth(100)
+        back.clicked.connect(self.go_home.emit)
+        top.addWidget(back)
+        root.addLayout(top)
+ 
+        self.user_sub = QLabel("")
+        self.user_sub.setStyleSheet(f"color:{TEXT_SEC}; font-size:12px;")
+        root.addWidget(self.user_sub)
+ 
+ 
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        container = QWidget()
+        scroll.setWidget(container)
+        self.content_lay = QVBoxLayout(container)
+        self.content_lay.setContentsMargins(0, 0, 0, 0)
+        self.content_lay.setSpacing(14)
+        root.addWidget(scroll)
+ 
+    def load(self, username):
+        self.username = username
+        self.user_sub.setText(f"User: {username}  ·  Last 7 days")
+ 
+        while self.content_lay.count():
+            item = self.content_lay.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+ 
+        days, stats = self.store.weekly_stats(username)
+        tg = sum(s["good"]    for s in stats.values())
+        tb = sum(s["bad"]     for s in stats.values())
+        ta = sum(s["alerts"]  for s in stats.values())
+        tm = sum(s["minutes"] for s in stats.values())
+        tf = tg + tb or 1
+ 
+ 
+        # summary
+        row = QHBoxLayout()
+        row.setSpacing(12)
+        for val, lbl, color in [
+            (f"{int(tg/tf*100)}%", "Good Posture",   GOOD),
+            (str(ta),              "Total Alerts",   WARN),
+            (f"{tm}m",             "Active Minutes", ACCENT2),
+        ]:
+            c  = Card()
+            cl = QVBoxLayout(c)
+            cl.setContentsMargins(18, 16, 18, 16)
+            v  = QLabel(val)
+            v.setStyleSheet(f"font-size:32px; font-weight:900; color:{color};")
+            v.setAlignment(Qt.AlignCenter)
+            cl.addWidget(v)
+            l = QLabel(lbl)
+            l.setStyleSheet(f"color:{TEXT_SEC}; font-size:11px; letter-spacing:2px;")
+            l.setAlignment(Qt.AlignCenter)
+            cl.addWidget(l)
+            row.addWidget(c)
+        self.content_lay.addLayout(row)
+ 
+ 
+        # daily bars
+        chart = Card()
+        cl    = QVBoxLayout(chart)
+        cl.setContentsMargins(20, 18, 20, 18)
+        cl.setSpacing(14)
+        hdr = QLabel("DAILY BREAKDOWN")
+        hdr.setStyleSheet(f"color:{TEXT_SEC}; font-size:10px; letter-spacing:3px;")
+        cl.addWidget(hdr)
+ 
+        max_f = max((s["good"]+s["bad"] for s in stats.values()), default=1) or 1
+        for day in days:
+            s     = stats[day]
+            total = s["good"] + s["bad"]
+            drow  = QHBoxLayout()
+            drow.setSpacing(12)
+            dl = QLabel(day)
+            dl.setFixedWidth(55)
+            dl.setStyleSheet(f"color:{TEXT_PRI}; font-size:12px;")
+            drow.addWidget(dl)
+            bar = PostureBar(s["good"], s["bad"])
+            bar.setFixedHeight(18)
+            bar.setFixedWidth(max(int(200 * total / max_f), 4))
+            drow.addWidget(bar)
+            if total > 0:
+                inf = QLabel(f"{int(s['good']/total*100)}% good  ·  {s['alerts']} alerts  ·  {s['minutes']}m")
+                inf.setStyleSheet(f"color:{TEXT_SEC}; font-size:11px;")
+            else:
+                inf = QLabel("No data")
+                inf.setStyleSheet(f"color:{BORDER}; font-size:11px;")
+            drow.addWidget(inf)
+            drow.addStretch()
+            cl.addLayout(drow)
+        self.content_lay.addWidget(chart)
+        self.content_lay.addStretch()
+ 
+ 
+ 
+# ─── Main Window ──────────────────────────────────────────────────────────────
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("PostureGuard — Office Ergonomics")
+        self.setMinimumSize(1020, 680)
+        self.setStyleSheet(style_sheet())
+ 
+        self.analyser = PostureAnalyser()
+        self.store    = DataStore()
+        self.stack    = QStackedWidget()
+        self.setCentralWidget(self.stack)
+ 
+        self._make_screens()
+ 
+    def _make_screens(self):
+        self.welcome = WelcomeScreen(self.store)
+        self.monitor = MonitorScreen(self.analyser, self.store)
+        self.stats   = StatsScreen(self.store)
+        for w in (self.welcome, self.monitor, self.stats):
+            self.stack.addWidget(w)
+        self.welcome.go_monitor.connect(self._start_monitor)
+        self.welcome.go_stats.connect(self._show_stats)
+        self.monitor.go_home.connect(self._go_home)
+        self.monitor.go_stats.connect(self._show_stats)
+        self.stats.go_home.connect(self._go_home)
+ 
+    def _start_monitor(self, name):
+        self.stack.setCurrentWidget(self.monitor)
+        self.monitor.start_session(name)
+ 
+    def _show_stats(self, name):
+        self.stats.load(name)
+        self.stack.setCurrentWidget(self.stats)
+ 
+    def _go_home(self):
+        # rebuild welcome to refresh user list
+        self.stack.removeWidget(self.welcome)
+        self.welcome.deleteLater()
+        self.welcome = WelcomeScreen(self.store)
+        self.welcome.go_monitor.connect(self._start_monitor)
+        self.welcome.go_stats.connect(self._show_stats)
+        self.stack.insertWidget(0, self.welcome)
+        self.stack.setCurrentWidget(self.welcome)
+ 
+    def closeEvent(self, event):
+        if self.monitor.worker:
+            self.monitor.worker.stop()
+        event.accept()
+ 
+ 
+# ─── Entry point ──────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setApplicationName("PostureGuard")
+    w = MainWindow()
+    w.show()
+    sys.exit(app.exec_())
