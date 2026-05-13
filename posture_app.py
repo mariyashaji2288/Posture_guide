@@ -19,7 +19,43 @@ from PyQt5.QtGui import (
     QImage, QPixmap, QColor, QPainter, QPen, QBrush
 )
 
+def play_alert_sound():
+    import threading
+    def _play():
+        try:
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+            winsound.Beep(1000, 300)
+            winsound.Beep(800, 300)
+            winsound.Beep(1000, 300)
+        except Exception:
+            try:
+                import os
+                os.system("paplay /usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga")
+            except Exception:
+                pass
+    threading.Thread(target=_play, daemon=True).start()
+
+def play_alert_sound():
+    import threading
+    def _play():
+        try:
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+            winsound.Beep(900, 150)
+            winsound.Beep(900, 150)
+            winsound.Beep(900, 150)
+            winsound.Beep(900, 400)
+        except Exception:
+            try:
+                import os
+                os.system("paplay /usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga")
+            except Exception:
+                pass
+    threading.Thread(target=_play, daemon=True).start()
+
 def show_posture_popup(parent=None):
+    play_alert_sound()
     msg = QMessageBox(parent)
     msg.setWindowTitle("⚠ Posture Alert")
     msg.setText(
@@ -29,7 +65,6 @@ def show_posture_popup(parent=None):
         "Please sit up straight and\n"
         "correct your position now!"
     )
-    
     msg.setIcon(QMessageBox.Warning)
     msg.setStandardButtons(QMessageBox.Ok)
     msg.setStyleSheet("""
@@ -60,7 +95,6 @@ DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
 POSTURE_ALERT_SECONDS = 20
 CHECK_INTERVAL_MS     = 500
  
- 
 # ─── Colors ───────────────────────────────────────────────────────────────────
 DARK_BG  = "#0D0F14"
 CARD_BG  = "#141720"
@@ -73,8 +107,6 @@ TEXT_PRI = "#F0F4FF"
 TEXT_SEC = "#8892AA"
 BORDER   = "#252A38"
 
- 
- 
 # ─── Posture Analyser (heuristic only — no torch dependency) ──────────────────
 class PostureAnalyser:
     """
@@ -201,7 +233,6 @@ class PostureAnalyser:
         cv2.putText(annotated, label, (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
         return label, conf, annotated
- 
  
  
 # ─── Data Store ───────────────────────────────────────────────────────────────
@@ -374,7 +405,6 @@ def style_sheet():
     }}
     """
  
- 
 # ─── Custom widgets ───────────────────────────────────────────────────────────
 class Card(QFrame):
     def __init__(self, *args, **kwargs):
@@ -440,8 +470,6 @@ class AlertBanner(QWidget):
         self._anim.setStartValue(self.maximumHeight())
         self._anim.setEndValue(0)
         self._anim.start()
- 
- 
  
 # ─── Welcome Screen ───────────────────────────────────────────────────────────
 class WelcomeScreen(QWidget):
@@ -552,7 +580,6 @@ class WelcomeScreen(QWidget):
         self.store.ensure_user(name)
         self.go_stats.emit(name)
  
- 
 # ─── Monitor Screen ───────────────────────────────────────────────────────────
 class MonitorScreen(QWidget):
     go_home  = pyqtSignal()
@@ -574,7 +601,6 @@ class MonitorScreen(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 16, 20, 16)
         root.setSpacing(10)
- 
  
         # top bar
         top = QHBoxLayout()
@@ -644,7 +670,6 @@ class MonitorScreen(QWidget):
         self.timer_lbl.setWordWrap(True)
         sl.addWidget(self.timer_lbl)
         rp.addWidget(sc)
- 
  
         # stats
         stc = Card()
@@ -818,8 +843,6 @@ class MonitorScreen(QWidget):
             self.timer_lbl.setText(f"🚨  Still in bad posture! ({seconds}s total)")
             self.timer_lbl.setStyleSheet(f"color:{DANGER}; font-size:12px; font-weight:bold;")
  
- 
- 
 # ─── Stats Screen ─────────────────────────────────────────────────────────────
 class StatsScreen(QWidget):
     go_home = pyqtSignal()
@@ -902,7 +925,6 @@ class StatsScreen(QWidget):
             row.addWidget(c)
         self.content_lay.addLayout(row)
  
- 
         # daily bars
         chart = Card()
         cl    = QVBoxLayout(chart)
@@ -937,8 +959,6 @@ class StatsScreen(QWidget):
             cl.addLayout(drow)
         self.content_lay.addWidget(chart)
         self.content_lay.addStretch()
- 
- 
  
 # ─── Main Window ──────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
