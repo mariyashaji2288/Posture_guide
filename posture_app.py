@@ -1,4 +1,8 @@
- self.face_cascade = cv2.CascadeClassifier(
-    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-)
-faces = self.face_cascade.detectMultiScale(gray, 1.1, 5)
+ if face_top_rel < 0.12:
+    label = "Leaning Back"
+
+elif face_top_rel > 0.42:
+    label = "Slouching"
+
+else:
+    label = "Good Posture"
