@@ -1,1 +1,1 @@
- class StatsScreen(QWidget):
+ from reportlab.pdfgen import canvas
