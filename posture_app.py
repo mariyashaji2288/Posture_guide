@@ -1,1 +1,1 @@
- class DataStore:
+ class StatsScreen(QWidget):
