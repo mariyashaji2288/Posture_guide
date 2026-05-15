@@ -1,1 +1,1 @@
- QMessageBox.Warning
+ class DataStore:
