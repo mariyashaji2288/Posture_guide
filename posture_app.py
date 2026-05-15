@@ -1,6 +1,12 @@
-import sys
-import cv2
-import numpy as np
-from PyQt5.QtWidgets import QApplication, QLabel, QWidget, QVBoxLayout
-from PyQt5.QtGui import QImage, QPixmap
-from PyQt5.QtCore import QTimer
+class MainWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+
+        self.setWindowTitle("PostureGuard")
+
+        layout = QVBoxLayout()
+
+        self.label = QLabel("Camera Loading...")
+        layout.addWidget(self.label)
+
+        self.setLayout(layout)
