@@ -1,1 +1,1 @@
-class AlertBanner(QWidget):
+ self._dnd = False
