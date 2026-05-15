@@ -1,1 +1,1 @@
- THEMES = {
+class AlertBanner(QWidget):
